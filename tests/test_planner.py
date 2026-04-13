@@ -73,6 +73,57 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(accounts[0].weekly_limit.percent_left, 83.0)
         self.assertLess(accounts[0].short_limit.reset_at, accounts[0].weekly_limit.reset_at)
 
+    def test_parse_status_output_supports_json_and_prefers_codex_bucket(self) -> None:
+        status_payload = {
+            "profiles": [
+                {
+                    "id": "ayan.second.mail@gmail.com-plus",
+                    "label": "ayan.second",
+                    "email": "ayan.second.mail@gmail.com",
+                    "plan": "Plus",
+                    "is_current": True,
+                    "usage": {
+                        "state": "ok",
+                        "buckets": [
+                            {
+                                "id": "codex_bengalfox",
+                                "label": "GPT-5.3-Codex-Spark",
+                                "five_hour": {
+                                    "left_percent": 100,
+                                    "reset_at": (self.now + timedelta(hours=6)).timestamp(),
+                                },
+                                "weekly": {
+                                    "left_percent": 100,
+                                    "reset_at": (self.now + timedelta(days=6)).timestamp(),
+                                },
+                            },
+                            {
+                                "id": "codex",
+                                "label": "codex",
+                                "five_hour": {
+                                    "left_percent": 75,
+                                    "reset_at": (self.now + timedelta(hours=5)).timestamp(),
+                                },
+                                "weekly": {
+                                    "left_percent": 92,
+                                    "reset_at": (self.now + timedelta(days=5)).timestamp(),
+                                },
+                            },
+                        ],
+                    },
+                    "error": None,
+                }
+            ]
+        }
+
+        accounts = planner.parse_status_output(json.dumps(status_payload), self.now)
+
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0].plan, "PLUS")
+        self.assertTrue(accounts[0].is_current)
+        self.assertEqual(accounts[0].short_limit.percent_left, 75.0)
+        self.assertEqual(accounts[0].weekly_limit.percent_left, 92.0)
+
     def test_mark_current_account_uses_auth_account_id(self) -> None:
         accounts = planner.parse_status_output(SAMPLE_STATUS, self.now)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -341,6 +392,69 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(timeline), 3)
         self.assertFalse(warnings)
         self.assertEqual(next(metric for metric in metrics if metric.is_current).label, "ayan.second")
+
+    def test_collect_dashboard_data_skips_profiles_without_weekly_limits_from_json(self) -> None:
+        status_payload = {
+            "profiles": [
+                {
+                    "id": "ayan.second.mail@gmail.com-plus",
+                    "label": "ayan.second",
+                    "email": "ayan.second.mail@gmail.com",
+                    "plan": "Plus",
+                    "is_current": True,
+                    "usage": {
+                        "state": "ok",
+                        "buckets": [
+                            {
+                                "id": "codex",
+                                "label": "codex",
+                                "five_hour": {
+                                    "left_percent": 75,
+                                    "reset_at": (self.now + timedelta(hours=5)).timestamp(),
+                                },
+                                "weekly": {
+                                    "left_percent": 92,
+                                    "reset_at": (self.now + timedelta(days=5)).timestamp(),
+                                },
+                            }
+                        ],
+                    },
+                    "error": None,
+                },
+                {
+                    "id": "ayushika128@gmail.com-plus",
+                    "label": "ayushika",
+                    "email": "ayushika128@gmail.com",
+                    "plan": "Plus",
+                    "is_current": False,
+                    "usage": {
+                        "state": "ok",
+                        "buckets": [
+                            {
+                                "id": "codex",
+                                "label": "codex",
+                                "five_hour": {
+                                    "left_percent": 84,
+                                    "reset_at": (self.now + timedelta(hours=10)).timestamp(),
+                                },
+                                "weekly": None,
+                            }
+                        ],
+                    },
+                    "error": None,
+                },
+            ]
+        }
+
+        metrics, timeline, warnings = planner.collect_dashboard_data(
+            json.dumps(status_payload),
+            self.now,
+            3.0,
+        )
+
+        self.assertEqual([metric.label for metric in metrics], ["ayan.second"])
+        self.assertEqual([block.label for block in timeline], ["ayan.second"])
+        self.assertTrue(any("Skipped ayushika" in warning for warning in warnings))
 
     def test_render_dashboard_and_json_payload(self) -> None:
         accounts = planner.parse_status_output(SAMPLE_STATUS, self.now)

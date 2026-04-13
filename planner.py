@@ -9,7 +9,7 @@ import subprocess
 import sys
 import textwrap
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,12 @@ class AccountStatus:
     weekly_limit: ParsedLimit
     is_current: bool = False
     account_id: str | None = None
+
+
+@dataclass(frozen=True)
+class StatusParseResult:
+    accounts: list[AccountStatus]
+    warnings: list[str]
 
 
 @dataclass(frozen=True)
@@ -119,7 +125,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run_status_command() -> str:
     try:
         completed = subprocess.run(
-            ["codex-profiles", "status", "--all", "--plain"],
+            ["codex-profiles", "status", "--all", "--json"],
             check=False,
             capture_output=True,
             text=True,
@@ -129,7 +135,7 @@ def run_status_command() -> str:
 
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or "unknown error"
-        raise RuntimeError(f"`codex-profiles status --all --plain` failed: {stderr}")
+        raise RuntimeError(f"`codex-profiles status --all --json` failed: {stderr}")
 
     return completed.stdout
 
@@ -163,7 +169,7 @@ def parse_relative_duration(text: str) -> timedelta:
     return timedelta(seconds=seconds)
 
 
-def parse_status_output(output: str, now: datetime) -> list[AccountStatus]:
+def parse_plain_status_output(output: str, now: datetime) -> list[AccountStatus]:
     blocks = [block.strip() for block in re.split(r"\n\s*\n", output.strip()) if block.strip()]
     accounts: list[AccountStatus] = []
 
@@ -206,6 +212,119 @@ def parse_status_output(output: str, now: datetime) -> list[AccountStatus]:
         )
 
     return accounts
+
+
+def parse_timestamp_limit(limit_data: Any, now: datetime) -> ParsedLimit | None:
+    if not isinstance(limit_data, dict):
+        return None
+
+    percent_left = limit_data.get("left_percent")
+    reset_at_value = limit_data.get("reset_at")
+    if not isinstance(percent_left, (int, float)) or not isinstance(reset_at_value, (int, float)):
+        return None
+
+    reset_at = datetime.fromtimestamp(float(reset_at_value), tz=timezone.utc).astimezone(now.tzinfo)
+    reset_in = max(reset_at - now, timedelta(0))
+    return ParsedLimit(
+        percent_left=float(percent_left),
+        reset_in=reset_in,
+        reset_at=reset_at,
+    )
+
+
+def bucket_priority(bucket: dict[str, Any]) -> tuple[int, str]:
+    bucket_id = str(bucket.get("id", "")).strip().lower()
+    bucket_label = str(bucket.get("label", "")).strip().lower()
+    if bucket_id == "codex" or bucket_label == "codex":
+        return (0, bucket_label or bucket_id)
+    return (1, bucket_label or bucket_id)
+
+
+def parse_json_status_output(output: str, now: datetime) -> StatusParseResult:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON status output: {exc.msg}") from exc
+
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, list):
+        raise ValueError("JSON status output is missing a profiles list.")
+
+    accounts: list[AccountStatus] = []
+    warnings: list[str] = []
+
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            raise ValueError(f"Unexpected profile payload: {profile!r}")
+
+        plan = profile.get("plan")
+        email = profile.get("email")
+        label = profile.get("label")
+        if not isinstance(plan, str) or not isinstance(email, str) or not isinstance(label, str):
+            raise ValueError(f"Unexpected profile identity payload: {profile!r}")
+
+        usage = profile.get("usage")
+        if not isinstance(usage, dict):
+            warnings.append(f"Skipped {label}: missing usage details in codex-profiles output.")
+            continue
+
+        buckets = usage.get("buckets")
+        if not isinstance(buckets, list) or not buckets:
+            warnings.append(f"Skipped {label}: no usage buckets were returned.")
+            continue
+
+        valid_buckets: list[tuple[tuple[int, str], dict[str, Any], ParsedLimit, ParsedLimit]] = []
+        missing_weekly_bucket_labels: list[str] = []
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+
+            short_limit = parse_timestamp_limit(bucket.get("five_hour"), now)
+            weekly_limit = parse_timestamp_limit(bucket.get("weekly"), now)
+            if short_limit and weekly_limit:
+                valid_buckets.append((bucket_priority(bucket), bucket, short_limit, weekly_limit))
+                continue
+
+            bucket_name = str(bucket.get("label") or bucket.get("id") or "unknown bucket")
+            if short_limit and weekly_limit is None:
+                missing_weekly_bucket_labels.append(bucket_name)
+
+        if not valid_buckets:
+            if missing_weekly_bucket_labels:
+                bucket_text = ", ".join(missing_weekly_bucket_labels)
+                warnings.append(
+                    f"Skipped {label}: missing weekly limit data for {bucket_text}."
+                )
+            else:
+                warnings.append(
+                    f"Skipped {label}: no bucket exposed both 5-hour and weekly limit data."
+                )
+            continue
+
+        _, _, short_limit, weekly_limit = min(valid_buckets, key=lambda item: item[0])
+        accounts.append(
+            AccountStatus(
+                plan=plan.upper(),
+                email=email,
+                label=label,
+                short_limit=short_limit,
+                weekly_limit=weekly_limit,
+                is_current=bool(profile.get("is_current")),
+            )
+        )
+
+    return StatusParseResult(accounts=accounts, warnings=warnings)
+
+
+def parse_status_data(output: str, now: datetime) -> StatusParseResult:
+    stripped = output.lstrip()
+    if stripped.startswith("{"):
+        return parse_json_status_output(stripped, now)
+    return StatusParseResult(accounts=parse_plain_status_output(output, now), warnings=[])
+
+
+def parse_status_output(output: str, now: datetime) -> list[AccountStatus]:
+    return parse_status_data(output, now).accounts
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -253,7 +372,7 @@ def mark_current_account(
     for account in accounts:
         profile = email_lookup.get(account.email) or label_lookup.get(account.label)
         account_id = profile.get("account_id") if profile else None
-        is_current = bool(current_account_id and account_id == current_account_id)
+        is_current = account.is_current or bool(current_account_id and account_id == current_account_id)
         marked.append(
             AccountStatus(
                 plan=account.plan,
@@ -1257,11 +1376,14 @@ def collect_dashboard_data(
     auth_path: Path | None = None,
     profiles_path: Path | None = None,
 ) -> tuple[list[AccountMetrics], list[TimelineBlock], list[str]]:
-    parsed_accounts = parse_status_output(status_output, now)
-    marked_accounts = mark_current_account(parsed_accounts, auth_path=auth_path, profiles_path=profiles_path)
+    parse_result = parse_status_data(status_output, now)
+    if not parse_result.accounts:
+        raise ValueError("No profiles exposed both 5-hour and weekly limit data.")
+
+    marked_accounts = mark_current_account(parse_result.accounts, auth_path=auth_path, profiles_path=profiles_path)
     metrics = build_metrics(marked_accounts, now, window_hours, previous_snapshot=previous_snapshot)
     timeline, warnings = build_timeline(metrics, now)
-    return metrics, timeline, warnings
+    return metrics, timeline, parse_result.warnings + warnings
 
 
 def main(argv: list[str] | None = None) -> int:
