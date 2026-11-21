@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+This tool reports the owner's Codex CLI account usage, so references to Codex describe the product. Agents in this repo are Claude Fable 5.2 (planning, review, leading rounds) and Claude Opus 5.5 (implementation, evidence-gathering, review). Don't add instructions for other coding agents.
+
 ## Project Structure & Module Organization
 `planner.py` is the entire application: CLI argument parsing, `codex-profiles` integration, pacing logic, snapshot persistence, and terminal/JSON rendering all live there. Tests are in `tests/test_planner.py` and cover parsing, tracking, timeline generation, snapshot round-trips, and output rendering.
 
@@ -37,4 +39,4 @@ Pull requests should include:
 - Sample terminal or JSON output when dashboard rendering changes.
 
 ## Security & Configuration Tips
-`planner.py` reads local Codex state such as `~/.codex/auth.json`, `~/.codex/profiles/profiles.json`, and the default snapshot file under `~/.codex/`. Do not commit real account data, auth material, or generated state files.
+`planner.py` reads local Codex state such as `~/.codex/auth.json`, `~/.codex/profiles/profiles.json`, and the default snapshot file under `~/.codex/`. Never commit, print or copy real account data, auth material (`auth.json`) or generated state files, because they hold the owner's live Codex credentials.
